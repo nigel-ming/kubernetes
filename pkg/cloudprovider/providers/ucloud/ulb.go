@@ -1,16 +1,33 @@
 package ucloud
 
 import (
+	"bytes"
 	"crypto/sha1"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"golang.org/x/crypto/ssh"
 	"io"
+	"io/ioutil"
 	"net/http"
 	"net/url"
 	"reflect"
 	"sort"
+	"strconv"
+	"strings"
 
 	"github.com/golang/glog"
+)
+
+// TODO gcfg
+const (
+	ssh_pem_key string = "/root/.ssh/id_rsa"
+	ssh_user    string = "root"
+	ssh_port    int64  = 22
+)
+
+var (
+	ssh_config *ssh.ClientConfig
 )
 
 type Parameter interface {
@@ -84,6 +101,27 @@ type DescribeUHostInstanceParam struct {
 	Tag        string `json:"tag"`
 	Offset     int    `json:"offset"`
 	Limit      int    `json:"limit"`
+}
+
+type GetUHostInstanceParam struct {
+	Action     string `json:"Action"`
+	PublicKey  string `json:"PublicKey"`
+	PrivateKey string `json:"PrivateKey"`
+	Signature  string `json:"Signature"`
+	ProjectID  string `json:"ProjectId"`
+	Region     string `json:"Region"` // required
+	UHostID    string `json:"UHostIds.0"`
+}
+
+func (p *GetUHostInstanceParam) setKey(pubKey, privKey string) {
+	p.Action = "DescribeUHostInstance"
+	p.PublicKey = pubKey
+	p.PrivateKey = privKey
+}
+
+func (p GetUHostInstanceParam) QueryString() string {
+	params := toParams(p)
+	return params.toQueryString()
 }
 
 type DescribeUHostInstanceResponse struct {
@@ -172,6 +210,7 @@ type ULBSet struct {
 	ULBName       string `json:"ULBName,omitempty"`
 	Name          string `json:"Name"`
 	Tag           string `json:"Tag"`
+	PrivateIP     string `json:"PrivateIP"`
 	Remark        string `json:"Remark"`
 	BandwidthType int    `json:"BandwidthType"`
 	Bandwidth     int    `json:"Bandwidth"`
@@ -721,6 +760,69 @@ func (c UClient) AllocateBackend(p AllocateBackendParam) (*AllocateBackendRespon
 	return r, err
 }
 
+func (c UClient) AllocateULB4Backend(p AllocateBackendParam) (*AllocateBackendResponse, error) {
+	var (
+		host_ip string
+		ulb_ip  string
+	)
+	if p.ResourceType != "UHost" {
+		return nil, fmt.Errorf("AllocateULB4Backend not support ResourceType[%s]", p.ResourceType)
+	}
+	p1 := GetUHostInstanceParam{
+		Region:    p.Region,
+		ProjectID: p.ProjectID,
+		UHostID:   p.ResourceID,
+	}
+	r1, err := c.GetUHostInstance(p1)
+	glog.V(3).Infof("AllocateULB4Backend describe uhost response: %+v", r1)
+	if err != nil {
+		return nil, err
+	}
+	if r1.RetCode != 0 {
+		return nil, errors.New(r1.Message)
+	}
+	if len(r1.UHostSet) != 1 {
+		return nil, fmt.Errorf("AllocateULB4Backend uhost[%s] not found", p.ResourceID)
+	}
+
+	for _, ip := range r1.UHostSet[0].IPSet {
+		if ip.Type == "Private" {
+			host_ip = ip.IP
+			// TODO
+			host_ip = "120.132.26.175"
+			break
+		}
+	}
+
+	p2 := DescribeULBParam{
+		Region:    p.Region,
+		ProjectID: p.ProjectID,
+		ULBID:     p.ULBID,
+	}
+	r2, err := c.DescribeULB(p2)
+	glog.V(3).Infof("AllocateULB4Backend describe ULB response: %+v", r2)
+	if err != nil {
+		return nil, err
+	}
+	if r2.RetCode != 0 {
+		return nil, errors.New(r2.Message)
+	}
+	if len(r2.DataSet) != 1 {
+		return nil, ULBNotFound
+	}
+	ulb_ip = r2.DataSet[0].PrivateIP
+	if ulb_ip == "" {
+		return nil, errors.New("AllocateULB4Backend ulb has invalid private ip")
+	}
+
+	err = ifupULB4(host_ip, ulb_ip)
+	if err != nil {
+		return nil, err
+	}
+
+	return c.AllocateBackend(p)
+}
+
 func (c UClient) UpdateBackendAttribute(p UpdateBackendAttributeParam) (*UpdateBackendAttributeResponse, error) {
 	p.setKey(c.PublicKey, c.PrivateKey)
 	resp, err := http.Get(c.GetQueryURL(p))
@@ -810,4 +912,92 @@ func (c UClient) DescribeUHostInstance(p DescribeUHostInstanceParam) (*DescribeU
 	r := &DescribeUHostInstanceResponse{}
 	err = json.NewDecoder(resp.Body).Decode(r)
 	return r, err
+}
+
+func (c UClient) GetUHostInstance(p GetUHostInstanceParam) (*DescribeUHostInstanceResponse, error) {
+	p.setKey(c.PublicKey, c.PrivateKey)
+	resp, err := http.Get(c.GetQueryURL(p))
+	glog.V(3).Infof("GetUHostInstance request url: %s", c.GetQueryURL(p))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	r := &DescribeUHostInstanceResponse{}
+	err = json.NewDecoder(resp.Body).Decode(r)
+	return r, err
+}
+
+// TODO not panic in init
+func init() {
+	b, err := ioutil.ReadFile(ssh_pem_key)
+	if err != nil {
+		panic(err)
+	}
+	signer, err := ssh.ParsePrivateKey(b)
+	if err != nil {
+		panic(err)
+	}
+	ssh_config = &ssh.ClientConfig{
+		User: ssh_user,
+		Auth: []ssh.AuthMethod{ssh.PublicKeys(signer)},
+	}
+}
+
+func ip2long(ipstr string) (uint32, error) {
+	var (
+		ip        uint32   = 0
+		ip_pieces []string = strings.Split(ipstr, ".")
+	)
+
+	if len(ip_pieces) != 4 {
+		return ip, errors.New("invalid ip format")
+	}
+
+	ip1, _ := strconv.Atoi(ip_pieces[0])
+	ip2, _ := strconv.Atoi(ip_pieces[1])
+	ip3, _ := strconv.Atoi(ip_pieces[2])
+	ip4, _ := strconv.Atoi(ip_pieces[3])
+
+	if ip1 > 255 || ip2 > 255 || ip3 > 255 || ip4 > 255 {
+		return ip, errors.New("invalid ip format")
+	}
+
+	ip += uint32(ip1 * 0x1000000)
+	ip += uint32(ip2 * 0x10000)
+	ip += uint32(ip3 * 0x100)
+	ip += uint32(ip4)
+
+	return ip, nil
+}
+
+func ifupULB4(host_ip string, ulb_ip string) error {
+	iplong, err := ip2long(ulb_ip)
+	if err != nil {
+		return err
+	}
+
+	conn, err := ssh.Dial("tcp", fmt.Sprintf("%s:%d", host_ip, ssh_port), ssh_config)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	session, err := conn.NewSession()
+	if err != nil {
+		return err
+	}
+	defer session.Close()
+	cmd := fmt.Sprintf("echo -e \"DEVICE=lo:%d\nIPADDR=%s\nNETMASK=255.255.255.255\" > /etc/sysconfig/network-scripts/ifcfg-lo:%d; ifup lo:%d", iplong, ulb_ip, iplong, iplong)
+	glog.V(3).Infof("ifupULB4: %s %s", host_ip, cmd)
+
+	var (
+		stdout bytes.Buffer
+		stderr bytes.Buffer
+	)
+	session.Stdout = &stdout
+	session.Stderr = &stderr
+
+	err = session.Run(cmd)
+	glog.V(3).Infof("ifupULB4: %+v %+v %+v", err, stdout.String(), stderr.String())
+
+	return err
 }
